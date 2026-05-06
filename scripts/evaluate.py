@@ -5,12 +5,14 @@ Evaluates Faster R-CNN on test data with comprehensive metrics:
   - Sensitivity (Recall) at IoU=0.5
   - mAP@0.5, mAP@0.75, mAP@0.5:0.95
   - Inference time (per image, FPS)
+  - Visualization of predictions with bounding boxes
 
 Usage:
     python scripts/evaluate.py \
         --image_dir data/test/images \
         --annotation_file data/test/annotations.json \
-        --checkpoint output/finetune/v3/checkpoints/best.pth
+        --checkpoint output/finetune/v3/checkpoints/best.pth \
+        --vis_count 20
 """
 
 import argparse
@@ -21,6 +23,7 @@ import time
 
 import torch
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -167,15 +170,28 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--score_thresh', type=float, default=0.05,
-                        help='Min detection score')
+                        help='Min detection score for metrics')
     parser.add_argument('--warmup_iters', type=int, default=10,
                         help='GPU warmup iterations before timing')
+    
+    # Visualization
+    parser.add_argument('--vis_count', type=int, default=20,
+                        help='Number of sample images to visualize (0=disable)')
+    parser.add_argument('--vis_score_thresh', type=float, default=0.3,
+                        help='Min score for drawing prediction boxes')
+    parser.add_argument('--vis_dir', type=str, default=None,
+                        help='Directory to save visualizations')
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+
+    # Default visualization directory
+    vis_dir = args.vis_dir
+    if vis_dir is None:
+        vis_dir = os.path.join(os.path.dirname(args.checkpoint), 'visualizations')
 
     # --- Load dataset ---
     dataset = DentalPanoramicDetectionDataset(
@@ -205,7 +221,7 @@ def main():
     # --- GPU warmup (for accurate timing) ---
     if device.type == 'cuda':
         print(f"\nWarming up GPU ({args.warmup_iters} iters)...")
-        dummy = torch.randn(1, 3, 512, 512, device=device)
+        dummy = torch.randn(3, 512, 512, device=device)
         for _ in range(args.warmup_iters):
             with torch.no_grad():
                 _ = model([dummy])
@@ -323,6 +339,176 @@ def main():
     with open(output_file, 'w') as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to: {output_file}")
+
+    # --- Visualize predictions ---
+    if args.vis_count > 0:
+        visualize_predictions(
+            dataset=dataset,
+            model=model,
+            device=device,
+            num_images=args.vis_count,
+            score_thresh=args.vis_score_thresh,
+            output_dir=vis_dir,
+        )
+
+
+# =========================================================================
+# Visualization
+# =========================================================================
+
+def visualize_predictions(dataset, model, device, num_images, score_thresh,
+                          output_dir):
+    """Draw GT and prediction bounding boxes on sample images and save.
+    
+    - Green boxes = Ground Truth
+    - Red boxes = Predictions (with confidence score)
+    - Blue dashed = False Negatives (GT not matched)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    model.eval()
+    
+    # Select images: prefer images that have annotations
+    indices_with_gt = []
+    indices_without_gt = []
+    for i in range(len(dataset)):
+        img_id = dataset.image_ids[i]
+        anns = dataset.annotations.get(img_id, [])
+        if len(anns) > 0:
+            indices_with_gt.append(i)
+        else:
+            indices_without_gt.append(i)
+    
+    # Mix: prioritize images with GT, fill rest with no-GT
+    np.random.seed(42)
+    selected = []
+    if len(indices_with_gt) > 0:
+        n_gt = min(num_images, len(indices_with_gt))
+        selected.extend(np.random.choice(indices_with_gt, n_gt, replace=False).tolist())
+    remaining = num_images - len(selected)
+    if remaining > 0 and len(indices_without_gt) > 0:
+        n_no = min(remaining, len(indices_without_gt))
+        selected.extend(np.random.choice(indices_without_gt, n_no, replace=False).tolist())
+    
+    print(f"\nVisualizing {len(selected)} images → {output_dir}")
+    
+    for idx in tqdm(selected, desc="Drawing"):
+        image_tensor, target = dataset[idx]
+        img_id = dataset.image_ids[idx]
+        img_info = dataset.images[img_id]
+        filename = img_info['file_name']
+        
+        # Load original image (full resolution, not tensor)
+        img_path = os.path.join(str(dataset.image_dir), filename)
+        pil_image = Image.open(img_path).convert('RGB')
+        orig_w, orig_h = pil_image.size
+        
+        # Run inference on tensor
+        with torch.no_grad():
+            outputs = model([image_tensor.to(device)])
+        output = outputs[0]
+        
+        # Tensor dimensions (may differ from original if dataset resized)
+        _, tensor_h, tensor_w = image_tensor.shape
+        scale_x = orig_w / tensor_w
+        scale_y = orig_h / tensor_h
+        
+        # Prepare drawing
+        draw = ImageDraw.Draw(pil_image)
+        
+        # Try to load a font, fallback to default
+        try:
+            font = ImageFont.truetype("arial.ttf", size=max(14, orig_h // 60))
+            font_small = ImageFont.truetype("arial.ttf", size=max(11, orig_h // 80))
+        except (IOError, OSError):
+            font = ImageFont.load_default()
+            font_small = font
+        
+        line_width = max(2, orig_h // 300)
+        
+        # --- Draw Ground Truth boxes (green) ---
+        gt_boxes = target['boxes'].numpy()
+        gt_matched = set()
+        
+        # Check which GTs are matched by predictions (IoU >= 0.5)
+        pred_boxes_np = output['boxes'].cpu().numpy()
+        pred_scores_np = output['scores'].cpu().numpy()
+        keep = pred_scores_np >= score_thresh
+        pred_boxes_filtered = pred_boxes_np[keep]
+        pred_scores_filtered = pred_scores_np[keep]
+        
+        if len(gt_boxes) > 0 and len(pred_boxes_filtered) > 0:
+            # Scale pred boxes to original image coords
+            pred_scaled = pred_boxes_filtered.copy()
+            pred_scaled[:, [0, 2]] *= scale_x
+            pred_scaled[:, [1, 3]] *= scale_y
+            
+            gt_scaled = gt_boxes.copy()
+            gt_scaled[:, [0, 2]] *= scale_x
+            gt_scaled[:, [1, 3]] *= scale_y
+            
+            iou_mat = compute_iou_matrix(pred_scaled, gt_scaled)
+            for gi in range(len(gt_scaled)):
+                max_iou = iou_mat[:, gi].max() if len(iou_mat) > 0 else 0
+                if max_iou >= 0.5:
+                    gt_matched.add(gi)
+        
+        for gi, box in enumerate(gt_boxes):
+            x1, y1, x2, y2 = box
+            # Scale to original image
+            x1, x2 = x1 * scale_x, x2 * scale_x
+            y1, y2 = y1 * scale_y, y2 * scale_y
+            
+            if gi in gt_matched:
+                # Matched GT → solid green
+                color = (0, 200, 0)
+                label = "GT (matched)"
+            else:
+                # Unmatched GT (false negative) → blue
+                color = (0, 100, 255)
+                label = "GT (missed)"
+            
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=line_width)
+            # Label background
+            text_bbox = draw.textbbox((x1, y1 - 18), label, font=font_small)
+            draw.rectangle(text_bbox, fill=color)
+            draw.text((x1, y1 - 18), label, fill=(255, 255, 255), font=font_small)
+        
+        # --- Draw Prediction boxes (red) ---
+        for pi in range(len(pred_boxes_filtered)):
+            box = pred_boxes_filtered[pi]
+            score = pred_scores_filtered[pi]
+            
+            x1, y1, x2, y2 = box
+            x1, x2 = x1 * scale_x, x2 * scale_x
+            y1, y2 = y1 * scale_y, y2 * scale_y
+            
+            # Color by confidence: bright red for high, dim for low
+            intensity = int(150 + 105 * score)
+            color = (intensity, 30, 30)
+            
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=line_width)
+            label = f"IO {score:.2f}"
+            text_bbox = draw.textbbox((x1, y2 + 2), label, font=font_small)
+            draw.rectangle(text_bbox, fill=color)
+            draw.text((x1, y2 + 2), label, fill=(255, 255, 255), font=font_small)
+        
+        # --- Add summary text ---
+        summary = (f"GT: {len(gt_boxes)} | "
+                   f"Pred: {len(pred_boxes_filtered)} | "
+                   f"Matched: {len(gt_matched)}")
+        text_bbox = draw.textbbox((10, 10), summary, font=font)
+        draw.rectangle(
+            [text_bbox[0]-4, text_bbox[1]-4, text_bbox[2]+4, text_bbox[3]+4],
+            fill=(0, 0, 0, 180)
+        )
+        draw.text((10, 10), summary, fill=(255, 255, 255), font=font)
+        
+        # Save
+        save_name = f"vis_{os.path.splitext(filename)[0]}.jpg"
+        save_path = os.path.join(output_dir, save_name)
+        pil_image.save(save_path, quality=95)
+    
+    print(f"Saved {len(selected)} visualizations to {output_dir}")
 
 
 if __name__ == '__main__':
